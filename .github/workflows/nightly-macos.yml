@@ -81,7 +81,21 @@ jobs:
         run: pnpm install --frozen-lockfile || pnpm install
 
       - name: Build macOS bundle
-        run: pnpm run build:mac
+        # Why: mirrors `pnpm run build:mac`, but the electron-builder call gains
+        # --publish never — the repo config carries a github publish block, and
+        # electron-builder's CI detection otherwise schedules an upload and
+        # demands GH_TOKEN (SuperCmd journal, failure #2).
+        run: |
+          set -euo pipefail
+          pnpm run build:desktop
+          pnpm run build:computer-macos
+          pnpm run build:notification-status-macos
+          pnpm run ensure:electron-runtime
+          ORCA_BUILD_COMMIT=$(git rev-parse --short=12 HEAD)
+          ORCA_LOCAL_BUILD_VERSION=$(node --input-type=module -e "import('./config/scripts/build-mac-local.mjs').then(m => console.log(m.getLocalBuildIdentity().version))")
+          export ORCA_BUILD_COMMIT ORCA_LOCAL_BUILD_VERSION
+          echo "version: $ORCA_LOCAL_BUILD_VERSION"
+          pnpm exec electron-builder --config config/electron-builder.config.cjs --mac --publish never
 
       - name: Upload arm64 bundle
         uses: actions/upload-artifact@v4
