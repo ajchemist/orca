@@ -1,0 +1,102 @@
+name: Nightly macOS bundle
+
+# Personal nightly pipeline (see NIGHTLY-PIPELINE.md on this branch).
+# - schedule / plain dispatch: assemble upstream/main + the patch manifest
+#   (.github/nightly-refs.txt) on the fly, build, upload the bundle artifact.
+# - dispatch with `ref`: build that ref as-is (no assembly).
+# This workflow lives ONLY on the fork's `nightly` branch so upstream PR
+# branches stay clean.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Build this ref as-is (skips patch assembly)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '30 18 * * *' # 03:30 KST
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      # Why: no signing identity in CI; stop electron-builder from probing.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Assemble upstream main + patch manifest
+        if: ${{ inputs.ref == '' }}
+        env:
+          UPSTREAM: https://github.com/stablyai/orca.git
+          FORK: https://github.com/ajchemist/orca.git
+        run: |
+          set -euo pipefail
+          git config user.name nightly-assembler
+          git config user.email nightly-assembler@users.noreply.github.com
+          # Manifest is read from the pipeline branch before switching bases.
+          cp .github/nightly-refs.txt /tmp/nightly-refs.txt
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream main
+          git checkout --detach upstream/main
+          echo "base: $(git rev-parse --short=12 HEAD) (upstream/main)"
+          while IFS= read -r raw; do
+            line="${raw%%#*}"
+            line="$(echo "$line" | xargs || true)"
+            [ -z "$line" ] && continue
+            case "$line" in
+              fork:*)     git fetch --no-tags "$FORK" "${line#fork:}" ;;
+              upstream:*) git fetch --no-tags upstream "${line#upstream:}" ;;
+              pr:*)       git fetch --no-tags upstream "pull/${line#pr:}/head" ;;
+              *) echo "unknown manifest entry: $line" >&2; exit 1 ;;
+            esac
+            echo "::group::merge $line ($(git rev-parse --short=12 FETCH_HEAD))"
+            git merge --no-ff --no-edit FETCH_HEAD \
+              || { echo "MERGE CONFLICT on $line — rebase that patch branch onto upstream/main" >&2; exit 1; }
+            echo "::endgroup::"
+          done < /tmp/nightly-refs.txt
+          echo "assembled: $(git rev-parse --short=12 HEAD)"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+          cache: pnpm
+
+      - name: Install dependencies
+        # Why: merged patch branches can drift from the lockfile; fall back
+        # to a full resolve instead of failing the nightly.
+        run: pnpm install --frozen-lockfile || pnpm install
+
+      - name: Build macOS bundle
+        run: pnpm run build:mac
+
+      - name: Upload arm64 bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: orca-nightly-macos-arm64
+          path: |
+            dist/orca-macos-arm64.dmg
+            dist/*arm64-mac.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload x64 bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: orca-nightly-macos-x64
+          path: dist/orca-macos-x64.dmg
+          if-no-files-found: warn
+          retention-days: 14
