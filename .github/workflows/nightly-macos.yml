@@ -25,8 +25,10 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 90
     env:
-      # Why: no signing identity in CI; stop electron-builder from probing.
-      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      # 'true' when the self-signed cert secrets are configured (see
+      # NIGHTLY-PIPELINE.md §3): the bundle is then signed as "Orca Local Dev"
+      # so macOS TCC grants survive across nightly rebuilds.
+      HAS_SIGNING_CERT: ${{ secrets.MAC_CERT_P12 != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,6 +68,30 @@ jobs:
           done < /tmp/nightly-refs.txt
           echo "assembled: $(git rev-parse --short=12 HEAD)"
 
+      - name: Import signing certificate
+        if: env.HAS_SIGNING_CERT == 'true'
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          echo "$MAC_CERT_P12" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          # Why: electron-builder only uses "valid" identities; a self-signed cert
+          # must be trusted for codeSign in the (disposable) runner's System
+          # keychain or it silently falls back to ad-hoc (SuperCmd journal §3-3).
+          openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -clcerts -nokeys -passin pass:"$MAC_CERT_PASSWORD" -out "$RUNNER_TEMP/cert.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/cert.pem"
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/cert.pem"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
@@ -95,7 +121,26 @@ jobs:
           ORCA_LOCAL_BUILD_VERSION=$(node --input-type=module -e "import('./config/scripts/build-mac-local.mjs').then(m => console.log(m.getLocalBuildIdentity().version))")
           export ORCA_BUILD_COMMIT ORCA_LOCAL_BUILD_VERSION
           echo "version: $ORCA_LOCAL_BUILD_VERSION"
-          pnpm exec electron-builder --config config/electron-builder.config.cjs --mac --publish never
+          SIGN_ARGS=()
+          if [ "$HAS_SIGNING_CERT" = "true" ]; then
+            # Why: CSC_NAME also drives the config's own Computer Use /
+            # notification helper signing hooks, so every TCC-relevant binary
+            # carries the same stable identity.
+            export CSC_NAME="Orca Local Dev"
+            SIGN_ARGS=('-c.mac.identity=Orca Local Dev')
+          else
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+          fi
+          pnpm exec electron-builder --config config/electron-builder.config.cjs --mac --publish never "${SIGN_ARGS[@]}"
+
+      - name: Verify signature identity
+        if: env.HAS_SIGNING_CERT == 'true'
+        run: |
+          set -euo pipefail
+          APP=$(ls -d dist/mac-arm64/*.app | head -1)
+          codesign -dv "$APP" 2>&1 | grep -E "Authority=|Signature" || true
+          codesign -dv "$APP" 2>&1 | grep -q "Authority=Orca Local Dev" \
+            || { echo "bundle is NOT signed with Orca Local Dev" >&2; exit 1; }
 
       - name: Upload arm64 bundle
         uses: actions/upload-artifact@v4
