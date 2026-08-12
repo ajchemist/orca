@@ -138,9 +138,12 @@ jobs:
         run: |
           set -euo pipefail
           APP=$(ls -d dist/mac-arm64/*.app | head -1)
-          codesign -dv "$APP" 2>&1 | grep -E "Authority=|Signature" || true
-          codesign -dv "$APP" 2>&1 | grep -q "Authority=Orca Local Dev" \
+          # Why: Authority lines only appear at -dvv verbosity; -dv false-negatives.
+          codesign -dvv "$APP" 2>&1 | grep -E "Authority=|Signature" || true
+          codesign -dvv "$APP" 2>&1 | grep -q "Authority=Orca Local Dev" \
             || { echo "bundle is NOT signed with Orca Local Dev" >&2; exit 1; }
+          codesign -dvv "$APP/Contents/Resources/Orca Computer Use.app" 2>&1 | grep -q "Authority=Orca Local Dev" \
+            || echo "warning: Computer Use helper not signed with Orca Local Dev (TCC identity may not persist for it)"
 
       - name: Upload arm64 bundle
         uses: actions/upload-artifact@v4
