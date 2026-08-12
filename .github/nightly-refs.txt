@@ -1,0 +1,8 @@
+# Patch manifest for the nightly assembly (one ref per line).
+#   fork:<branch>     — branch on ajchemist/orca
+#   upstream:<branch> — branch on stablyai/orca
+#   pr:<number>       — upstream PR head (curation: include someone else's PR)
+# Merged in order onto upstream/main. A conflict fails the build loudly —
+# rebase the offending branch onto upstream/main and push again.
+
+fork:feat/beads-task-source   # my PR https://github.com/stablyai/orca/pull/14013
